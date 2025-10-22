@@ -1,57 +1,76 @@
-$ProgressPreference = 'SilentlyContinue'
-$ErrorActionPreference = "Stop"
-$tmpdir = $Env:TEMP
-$BINSTALL_VERSION = $Env:BINSTALL_VERSION
-if ($BINSTALL_VERSION -and $BINSTALL_VERSION -notlike 'v*') {
-    # prefix version with v
-    $BINSTALL_VERSION = "v$BINSTALL_VERSION"
+#!/bin/sh
+
+set -eux
+
+do_curl() {
+    curl --retry 10 -A "Mozilla/5.0 (X11; Linux x86_64; rv:60.0) Gecko/20100101 Firefox/81.0" -L --proto '=https' --tlsv1.2 -sSf "$@"
 }
+
+# Set pipefail if it works in a subshell, disregard if unsupported
+# shellcheck disable=SC3040
+(set -o pipefail 2> /dev/null) && set -o pipefail
+
+case "${BINSTALL_VERSION:-}" in
+    "") ;; # unset
+    v*) ;; # already includes the `v`
+    *) BINSTALL_VERSION="v$BINSTALL_VERSION" ;; # Add a leading `v`
+esac
+
+cd "$(mktemp -d)"
+
 # Fetch binaries from `[..]/releases/latest/download/[..]` if _no_ version is
 # given, otherwise from `[..]/releases/download/VERSION/[..]`. Note the shifted
 # location of '/download'.
-$base_url = if (-not $BINSTALL_VERSION) {
-    "https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-"
-} else {
-    "https://github.com/cargo-bins/cargo-binstall/releases/download/$BINSTALL_VERSION/cargo-binstall-"
-}
+if [ -z "${BINSTALL_VERSION:-}" ]; then
+    base_url="https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-"
+else
+    base_url="https://github.com/cargo-bins/cargo-binstall/releases/download/${BINSTALL_VERSION}/cargo-binstall-"
+fi
 
-$proc_arch = [Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITECTURE", [EnvironmentVariableTarget]::Machine)
-$arch = $proc_arch -eq "AMD64" ? "x86_64" :
-        $proc_arch -eq "ARM64" ? "aarch64" :
-        $(throw "Unsupported Architecture: $proc_arch")
+os="$(uname -s)"
+if [ "$os" = "Darwin" ]; then
+    url="${base_url}universal-apple-darwin.zip"
+    do_curl -O "$url"
+    unzip cargo-binstall-universal-apple-darwin.zip
+elif [ "$os" = "Linux" ]; then
+    machine="$(uname -m)"
+    if [ "$machine" = "armv7l" ]; then
+        machine="armv7"
+    fi
+    target="${machine}-unknown-linux-musl"
+    if [ "$machine" = "armv7" ]; then
+        target="${target}eabihf"
+    fi
 
-$url = "$base_url$arch-pc-windows-msvc.zip"
-$sw = [Diagnostics.Stopwatch]::StartNew()
-# create temp with zip extension (or Expand will complain)
-$zip = New-TemporaryFile | Rename-Item -NewName { $_ -replace 'tmp$', 'zip' } –PassThru
-try {
-    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -MaximumRetryCount 3
-} catch {
-    throw "Failed to download: $_"
-}
-$zip | Expand-Archive -DestinationPath $tmpdir -Force
-$sw.Stop()
-Write-Verbose -Verbose "Download: $($sw.Elapsed.Seconds) seconds"
+    url="${base_url}${target}.tgz"
+    do_curl "$url" | tar -xvzf -
+elif [ "${OS-}" = "Windows_NT" ]; then
+    machine="$(uname -m)"
+    target="${machine}-pc-windows-msvc"
+    url="${base_url}${target}.zip"
+    do_curl -O "$url"
+    unzip "cargo-binstall-${target}.zip"
+else
+    echo "Unsupported OS ${os}"
+    exit 1
+fi
 
+./cargo-binstall --self-install || ./cargo-binstall -y --force cargo-binstall
 
-$sw = [Diagnostics.Stopwatch]::StartNew()
-$ps = Start-Process -PassThru -Wait "$tmpdir\cargo-binstall.exe" "--self-install"
-if ($ps.ExitCode -ne 0) {
-    Invoke-Expression "$tmpdir\cargo-binstall.exe -y --force cargo-binstall"
-}
-$zip | Remove-Item
-$sw.Stop()
-Write-Verbose -Verbose "Installation: $($sw.Elapsed.Seconds) seconds"
+CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 
-$sw = [Diagnostics.Stopwatch]::StartNew()
-$cargo_home = $Env:CARGO_HOME ? $Env:CARGO_HOME : "$HOME\.cargo"
-$cargo_bin = Join-Path $cargo_home "bin"
-if ($Env:Path.ToLower() -split ";" -notcontains $cargo_bin.ToLower()) {
-    if ($Env:CI -and $Env:GITHUB_PATH) {
-        Add-Content -Path $Env:GITHUB_PATH -Value $cargo_bin
-    } else {
-        Write-Verbose -Verbose "Your path is missing $cargo_bin, you might want to add it."
-    }
-}
-$sw.Stop()
-Write-Verbose -Verbose "Path addition: $($sw.Elapsed.Seconds) seconds"
+case ":$PATH:" in
+    *":$CARGO_HOME/bin:"*) ;; # Cargo home is already in path
+    *) needs_cargo_home=1 ;;
+esac
+
+if [ -n "${needs_cargo_home:-}" ]; then
+    if [ -n "${CI:-}" ] && [ -n "${GITHUB_PATH:-}" ]; then
+        echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+    else
+        echo
+        printf "\033[0;31mYour path is missing %s, you might want to add it.\033[0m\n" "$CARGO_HOME/bin"
+        echo
+    fi
+fi
+
